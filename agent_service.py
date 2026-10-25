@@ -1,6 +1,6 @@
 import logging
 import requests
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status
+from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -27,7 +27,7 @@ class AppMessage(BaseModel):
 
 class OperationResponse(BaseModel):
     success: bool = Field(True, example=True)
-    message: str = Field(..., example="Задача генерации принята в обработку")
+    message: str = Field(..., example="Генерация и передача всех сегментов успешно завершена")
 
 
 class AgentSegment(BaseModel):
@@ -46,10 +46,8 @@ def split_text_by_bytes(text: str, max_bytes: int = 512) -> list[str]:
     start = 0
     while start < len(encoded):
         end = start + max_bytes
-        # Защита от разрезания многобайтового символа UTF-8 посередине
         chunk_bytes = encoded[start:end]
         chunk_str = chunk_bytes.decode("utf-8", errors="ignore")
-        # Сдвигаем указатель на фактически декодированное количество байт
         actual_bytes_len = len(chunk_str.encode("utf-8"))
         if actual_bytes_len == 0:
             break
@@ -58,8 +56,8 @@ def split_text_by_bytes(text: str, max_bytes: int = 512) -> list[str]:
     return chunks
 
 
-def process_llm_and_send_segments(task: AppMessage):
-    """Фоновая генерация в Ollama и отправка сегментов на транспортный уровень."""
+def generate_and_dispatch_segments(task: AppMessage) -> int:
+    """Синхронно генерирует структуру в LLM и передает все сегменты в транспорт."""
     logging.info(f"Запуск генерации структуры по теме: '{task.document_topic}' (timestamp: {task.timestamp})")
 
     system_prompt = (
@@ -70,7 +68,7 @@ def process_llm_and_send_segments(task: AppMessage):
     payload = {
         "model": OLLAMA_MODEL,
         "prompt": f"{system_prompt}\n\nТема документа: {task.document_topic}",
-        "stream": False  # Для точного подсчета total_segments ответ генерируется целиком перед нарезкой
+        "stream": False
     }
 
     try:
@@ -79,14 +77,15 @@ def process_llm_and_send_segments(task: AppMessage):
         full_text = response.json().get("response", "")
     except requests.RequestException as e:
         logging.error(f"Ошибка обращения к локальной Ollama: {e}")
-        return
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Сбой работы локальной LLM: {e}"
+        )
 
-    # Разбиение сгенерированного текста на сегменты по X байт
     raw_segments = split_text_by_bytes(full_text, max_bytes=SEGMENT_SIZE_BYTES)
     total_segments = len(raw_segments)
     logging.info(f"Генерация завершена. Сформировано сегментов: {total_segments} (по {SEGMENT_SIZE_BYTES} байт)")
 
-    # Отправка сегментов в эндпоинт /transfer транспортного уровня
     for idx, chunk in enumerate(raw_segments, start=1):
         segment_payload = AgentSegment(
             timestamp=task.timestamp,
@@ -102,28 +101,32 @@ def process_llm_and_send_segments(task: AppMessage):
                 timeout=5
             )
             logging.info(
-                f"Сегмент {idx}/{total_segments} отправлен на транспорт. "
-                f"Код ответа: {transfer_res.status_code}"
+                f"Сегмент {idx}/{total_segments} передан на транспортный уровень. "
+                f"Статус ответа: {transfer_res.status_code}"
             )
         except requests.RequestException as e:
             logging.error(f"Сбой отправки сегмента {idx} на транспортный уровень: {e}")
+
+    return total_segments
 
 
 # --- Эндпоинты сервиса ---
 
 @app.post(
     "/api/v1/generate",
-    status_code=status.HTTP_202_ACCEPTED,
+    status_code=status.HTTP_200_OK,
     response_model=OperationResponse,
-    summary="Прием темы документа от Транспортного уровня",
-    description="Принимает задачу генерации, инициирует локальную LLM и асинхронно отправляет сегменты в транспорт."
+    summary="Генерация структуры документа и отправка сегментов в транспорт",
+    description="Принимает тему документа, синхронно генерирует структуру через LLM, передает сегменты на транспорт и возвращает 200 OK по окончании."
 )
-def generate_document_structure(task: AppMessage, background_tasks: BackgroundTasks):
-    # Добавляем задачу в фон, чтобы мгновенно вернуть ответ 202
-    background_tasks.add_task(process_llm_and_send_segments, task)
+def generate_document_structure(task: AppMessage):
+    # Синхронно выполняем инференс и отправку
+    total = generate_and_dispatch_segments(task)
+    
+    # Ответ 200 OK возвращается ТОЛЬКО после того, как все сегменты отправлены
     return OperationResponse(
         success=True,
-        message=f"Задача по теме '{task.document_topic}' принята в обработку"
+        message=f"Генерация завершена. Успешно сформировано и передано {total} сегментов."
     )
 
 
