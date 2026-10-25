@@ -11,10 +11,11 @@ app = FastAPI(
     description="Сервис агентного уровня для генерации структуры документов через локальную LLM (Ollama) и передачи сегментов на транспортный уровень."
 )
 
-OLLAMA_API_URL = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "phi3"  # Локальная модель 1-7 млрд параметров
-TRANSPORT_TRANSFER_URL = "http://localhost:8080/api/v1/transfer"
-SEGMENT_SIZE_BYTES = 512  # Фиксированный размер сегмента (X байт)
+# Используем прямой IP 127.0.0.1 для исключения IPv6-задержек на Windows
+OLLAMA_CHAT_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_MODEL = "qwen2.5:3b"
+TRANSPORT_TRANSFER_URL = "http://127.0.0.1:8080/api/v1/transfer"
+SEGMENT_SIZE_BYTES = 512
 
 
 # --- Pydantic Схемы данных ---
@@ -57,24 +58,43 @@ def split_text_by_bytes(text: str, max_bytes: int = 512) -> list[str]:
 
 
 def generate_and_dispatch_segments(task: AppMessage) -> int:
-    """Синхронно генерирует структуру в LLM и передает все сегменты в транспорт."""
+    """Генерирует двухуровневую структуру через Chat API и быстро передает сегменты через HTTP-сессию."""
     logging.info(f"Запуск генерации структуры по теме: '{task.document_topic}' (timestamp: {task.timestamp})")
-
-    system_prompt = (
-        "Ты — технический архитектор. Создай подробную структуру документа (оглавление, разделы, подразделы) "
-        "на заданную тему. Форматируй ответ строго как нумерованный список разделов с кратким пояснением каждого пункта."
-    )
 
     payload = {
         "model": OLLAMA_MODEL,
-        "prompt": f"{system_prompt}\n\nТема документа: {task.document_topic}",
-        "stream": False
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Ты — ведущий системный архитектор. Создай подробную иерархическую структуру технического документа "
+                    "строго с глубиной вложенности 2 уровня (разделы и подразделы).\n\n"
+                    "Формат строго нумерованный:\n"
+                    "1. Название раздела\n"
+                    "   1.1. Название подраздела с кратким пояснением\n"
+                    "   1.2. Название подраздела с кратким пояснением\n"
+                    "2. Название раздела\n"
+                    "   2.1. Название подраздела...\n\n"
+                    "Обязательно включи минимум 5 основных разделов, в каждом по 2-3 подраздела. "
+                    "Пиши на русском языке, без вводных фраз, приветствий и заключений."
+                )
+            },
+            {
+                "role": "user",
+                "content": f"Тема документа: {task.document_topic}"
+            }
+        ],
+        "stream": False,
+        "options": {
+            "temperature": 0.2,
+            "num_predict": 1500  # Достаточный объем для полной структуры глубины 2
+        }
     }
 
     try:
-        response = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
+        response = requests.post(OLLAMA_CHAT_URL, json=payload, timeout=120)
         response.raise_for_status()
-        full_text = response.json().get("response", "")
+        full_text = response.json().get("message", {}).get("content", "")
     except requests.RequestException as e:
         logging.error(f"Ошибка обращения к локальной Ollama: {e}")
         raise HTTPException(
@@ -86,26 +106,28 @@ def generate_and_dispatch_segments(task: AppMessage) -> int:
     total_segments = len(raw_segments)
     logging.info(f"Генерация завершена. Сформировано сегментов: {total_segments} (по {SEGMENT_SIZE_BYTES} байт)")
 
-    for idx, chunk in enumerate(raw_segments, start=1):
-        segment_payload = AgentSegment(
-            timestamp=task.timestamp,
-            total_segments=total_segments,
-            segment_number=idx,
-            document_structure_segment=chunk
-        )
+    # requests.Session() удерживает единое TCP-соединение (Keep-Alive) без задержек переподключения
+    with requests.Session() as session:
+        for idx, chunk in enumerate(raw_segments, start=1):
+            segment_payload = AgentSegment(
+                timestamp=task.timestamp,
+                total_segments=total_segments,
+                segment_number=idx,
+                document_structure_segment=chunk
+            )
 
-        try:
-            transfer_res = requests.post(
-                TRANSPORT_TRANSFER_URL,
-                json=segment_payload.model_dump(),
-                timeout=5
-            )
-            logging.info(
-                f"Сегмент {idx}/{total_segments} передан на транспортный уровень. "
-                f"Статус ответа: {transfer_res.status_code}"
-            )
-        except requests.RequestException as e:
-            logging.error(f"Сбой отправки сегмента {idx} на транспортный уровень: {e}")
+            try:
+                transfer_res = session.post(
+                    TRANSPORT_TRANSFER_URL,
+                    json=segment_payload.model_dump(),
+                    timeout=5
+                )
+                logging.info(
+                    f"Сегмент {idx}/{total_segments} передан на транспортный уровень. "
+                    f"Статус ответа: {transfer_res.status_code}"
+                )
+            except requests.RequestException as e:
+                logging.error(f"Сбой отправки сегмента {idx} на транспортный уровень: {e}")
 
     return total_segments
 
@@ -117,13 +139,10 @@ def generate_and_dispatch_segments(task: AppMessage) -> int:
     status_code=status.HTTP_200_OK,
     response_model=OperationResponse,
     summary="Генерация структуры документа и отправка сегментов в транспорт",
-    description="Принимает тему документа, синхронно генерирует структуру через LLM, передает сегменты на транспорт и возвращает 200 OK по окончании."
+    description="Принимает тему документа, синхронно генерирует структуру глубины 2 через LLM, передает сегменты на транспорт и возвращает 200 OK по окончании."
 )
 def generate_document_structure(task: AppMessage):
-    # Синхронно выполняем инференс и отправку
     total = generate_and_dispatch_segments(task)
-    
-    # Ответ 200 OK возвращается ТОЛЬКО после того, как все сегменты отправлены
     return OperationResponse(
         success=True,
         message=f"Генерация завершена. Успешно сформировано и передано {total} сегментов."
@@ -136,7 +155,7 @@ def generate_document_structure(task: AppMessage):
 )
 def health_check():
     try:
-        res = requests.get("http://localhost:11434/api/tags", timeout=3)
+        res = requests.get("http://127.0.0.1:11434/api/tags", timeout=3)
         ollama_status = "connected" if res.status_code == 200 else "unavailable"
     except Exception:
         ollama_status = "offline"
